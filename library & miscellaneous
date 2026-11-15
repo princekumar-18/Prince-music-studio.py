@@ -1,0 +1,475 @@
+  # -------------------------------------------------------------------------
+    # LIBRARY, PLAYLISTS & TABLE MANAGEMENT
+    # -------------------------------------------------------------------------
+    def load_library_view(self, view_key):
+        self.current_view = view_key
+        self.current_playlist_id = None
+        titles = {
+            "all": "ALL SONGS IN LIBRARY",
+            "favorites": "❤️ FAVORITE SONGS",
+            "recent": "🕒 RECENTLY PLAYED HISTORY",
+            "most_played": "🔥 MOST PLAYED TRACKS",
+            "recommendations": "✨ SMART RECOMMENDED PLAYLIST",
+            "radio": "🌐 INTERNET RADIO STATIONS"
+        }
+        self.view_title_lbl.setText(titles.get(view_key, "LIBRARY"))
+        self.refresh_current_table()
+
+    def refresh_current_table(self):
+        query = self.search_input.text()
+        sort_by = self.sort_combo.currentText()
+
+        if self.current_view == "radio":
+            stations = self.db.get_radio_stations()
+            self.displayed_tracks = [
+                {
+                    "id": -st["id"],
+                    "filepath": st["url"],
+                    "title": st["name"],
+                    "artist": "Live Internet Stream",
+                    "album": st["genre"],
+                    "genre": st["genre"],
+                    "duration": 0.0,
+                    "play_count": 0,
+                    "is_favorite": 0,
+                    "lyrics": "Live Internet Radio Broadcast Stream."
+                }
+                for st in stations
+            ]
+        elif self.current_view == "playlist" and self.current_playlist_id is not None:
+            self.displayed_tracks = self.db.get_playlist_tracks(self.current_playlist_id)
+        elif self.current_view == "favorites":
+            self.displayed_tracks = self.db.get_favorites()
+        elif self.current_view == "recent":
+            self.displayed_tracks = self.db.get_recently_played()
+        elif self.current_view == "most_played":
+            self.displayed_tracks = self.db.get_most_played()
+        elif self.current_view == "recommendations":
+            self.displayed_tracks = self.db.get_recommendations()
+        else:
+            self.displayed_tracks = self.db.get_all_tracks(sort_by=sort_by, search_query=query)
+
+        self.track_table.setRowCount(len(self.displayed_tracks))
+        for row_idx, tr in enumerate(self.displayed_tracks):
+            fav_icon = "❤️" if tr.get("is_favorite") else "🤍"
+            dur_str = "LIVE" if tr["duration"] <= 0 and str(tr["filepath"]).startswith("http") else self.format_seconds(tr["duration"])
+            self.track_table.setItem(row_idx, 0, QTableWidgetItem(fav_icon))
+            self.track_table.setItem(row_idx, 1, QTableWidgetItem(tr["title"]))
+            self.track_table.setItem(row_idx, 2, QTableWidgetItem(tr["artist"]))
+            self.track_table.setItem(row_idx, 3, QTableWidgetItem(tr["album"]))
+            self.track_table.setItem(row_idx, 4, QTableWidgetItem(dur_str))
+            self.track_table.setItem(row_idx, 5, QTableWidgetItem(str(tr.get("play_count", 0))))
+
+    def add_songs_dialog(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Audio Files",
+            str(Path.home()),
+            "Audio Files (*.mp3 *.wav *.flac *.aac *.ogg *.m4a)"
+        )
+        if files:
+            self.ingest_files(files)
+
+    def import_folder_dialog(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Music Folder", str(Path.home()))
+        if not folder:
+            return
+        found_files = []
+        for root, _, filenames in os.walk(folder):
+            for fname in filenames:
+                if Path(fname).suffix.lower() in SUPPORTED_EXTENSIONS:
+                    found_files.append(os.path.join(root, fname))
+        if found_files:
+            self.ingest_files(found_files)
+        else:
+            QMessageBox.information(self, "No Audio Files", "No supported audio files were found in that folder.")
+
+    def ingest_files(self, file_list):
+        for fpath in file_list:
+            meta = MediaHelper.extract_metadata(fpath)
+            self.db.upsert_track(
+                fpath,
+                meta["title"],
+                meta["artist"],
+                meta["album"],
+                meta["genre"],
+                meta["duration"],
+                meta["lyrics"]
+            )
+        self.load_library_view("all")
+
+    def add_radio_dialog(self):
+        name, ok1 = QInputDialog.getText(self, "Add Internet Radio", "Station Name:")
+        if not ok1 or not name.strip():
+            return
+        url, ok2 = QInputDialog.getText(self, "Add Internet Radio", "Stream URL (http/https MP3/AAC/OGG):")
+        if ok2 and url.strip():
+            self.db.add_radio_station(name.strip(), url.strip())
+            self.load_library_view("radio")
+
+    # -------------------------------------------------------------------------
+    # PLAYBACK & TRANSPORT CONTROLS
+    # -------------------------------------------------------------------------
+    def on_table_double_clicked(self, row, _col):
+        if 0 <= row < len(self.displayed_tracks):
+            self.current_index = row
+            self.play_track_dict(self.displayed_tracks[row])
+
+    def play_track_dict(self, track):
+        self.current_track = track
+        fpath = track["filepath"]
+        self.engine.load_and_play(fpath)
+        self.play_btn.setText("⏸")
+
+        # Update Labels
+        self.now_title_lbl.setText(track["title"][:28])
+        self.now_artist_lbl.setText(track["artist"][:32])
+        self.hero_title_lbl.setText(track["title"])
+        self.hero_artist_lbl.setText(f"{track['artist']}  •  {track['album']}")
+        self.hero_meta_lbl.setText(f"Genre: {track.get('genre', 'Music')}  |  Source: {Path(fpath).suffix.upper() or 'STREAM'}")
+        self.fav_btn.setText("❤️" if track.get("is_favorite") else "🤍")
+        self.lyrics_box.setPlainText(track.get("lyrics", ""))
+
+        # Extract or Fetch Artwork
+        cover_bytes = None
+        if not str(fpath).startswith("http"):
+            meta = MediaHelper.extract_metadata(fpath)
+            cover_bytes = meta.get("cover_bytes")
+            if not cover_bytes:
+                cover_bytes = MediaHelper.fetch_online_artwork(track["artist"], track["album"])
+            if track["id"] > 0:
+                self.db.record_play(track["id"])
+
+        pix = MediaHelper.build_album_pixmap(track["title"], track["artist"], cover_bytes, 175)
+        self.artwork_label.setPixmap(pix)
+        self.refresh_current_table()
+
+    def toggle_play_pause(self):
+        if not self.current_track:
+            if self.displayed_tracks:
+                self.current_index = 0
+                self.play_track_dict(self.displayed_tracks[0])
+            return
+        if self.engine.is_playing():
+            self.engine.pause()
+            self.play_btn.setText("▶")
+        else:
+            self.engine.play()
+            self.play_btn.setText("⏸")
+
+    def stop_playback(self):
+        self.engine.stop()
+        self.play_btn.setText("▶")
+        self.seek_slider.setValue(0)
+        self.time_cur_lbl.setText("0:00")
+
+    def play_next(self):
+        if self.queue:
+            next_track = self.queue.pop(0)
+            self.refresh_queue_ui()
+            self.play_track_dict(next_track)
+            return
+        if not self.displayed_tracks:
+            return
+        if self.is_shuffle:
+            self.current_index = random.randint(0, len(self.displayed_tracks) - 1)
+        else:
+            self.current_index = (self.current_index + 1) % len(self.displayed_tracks)
+        self.play_track_dict(self.displayed_tracks[self.current_index])
+
+    def play_previous(self):
+        if not self.displayed_tracks:
+            return
+        self.current_index = (self.current_index - 1) % len(self.displayed_tracks)
+        self.play_track_dict(self.displayed_tracks[self.current_index])
+
+    def cycle_repeat_mode(self):
+        self.repeat_mode = (self.repeat_mode + 1) % 3
+        labels = ["🔁 Off", "🔁 All", "🔂 One"]
+        self.repeat_btn.setText(labels[self.repeat_mode])
+
+    def on_seek_released(self):
+        ratio = self.seek_slider.value() / 1000.0
+        self.engine.set_position_ratio(ratio)
+        self.is_seeking = False
+
+    def on_volume_changed(self, val):
+        self.engine.set_volume(val)
+        self.mute_btn.setText("🔇" if val == 0 else "🔊")
+
+    def toggle_mute(self):
+        if self.vol_slider.value() > 0:
+            self._saved_vol = self.vol_slider.value()
+            self.vol_slider.setValue(0)
+        else:
+            self.vol_slider.setValue(getattr(self, "_saved_vol", 80))
+
+    def toggle_current_favorite(self):
+        if not self.current_track or self.current_track["id"] <= 0:
+            return
+        new_state = self.db.toggle_favorite(self.current_track["id"])
+        self.current_track["is_favorite"] = int(new_state)
+        self.fav_btn.setText("❤️" if new_state else "🤍")
+        self.refresh_current_table()
+
+    # -------------------------------------------------------------------------
+    # CONTEXT MENU, METADATA EDITOR, PYDUB INSPECTOR & LYRICS
+    # -------------------------------------------------------------------------
+    def on_table_context_menu(self, pos):
+        row = self.track_table.rowAt(pos.y())
+        if row < 0 or row >= len(self.displayed_tracks):
+            return
+        track = self.displayed_tracks[row]
+        menu = QMenu(self)
+
+        play_act = menu.addAction("▶️ Play Now")
+        queue_act = menu.addAction("➕ Add to Up Next Queue")
+        fav_act = menu.addAction("❤️ Toggle Favorite")
+        edit_act = menu.addAction("✏️ Edit Metadata & Lyrics")
+        inspect_act = menu.addAction("🔬 Inspect Audio (pydub)")
+
+        pl_menu = menu.addMenu("📁 Add to Playlist")
+        playlists = self.db.get_playlists()
+        pl_actions = {}
+        for pl in playlists:
+            act = pl_menu.addAction(pl["name"])
+            pl_actions[act] = pl["id"]
+
+        chosen = menu.exec(self.track_table.viewport().mapToGlobal(pos))
+        if chosen == play_act:
+            self.current_index = row
+            self.play_track_dict(track)
+        elif chosen == queue_act:
+            self.queue.append(track)
+            self.refresh_queue_ui()
+        elif chosen == fav_act and track["id"] > 0:
+            self.db.toggle_favorite(track["id"])
+            self.refresh_current_table()
+        elif chosen == edit_act and track["id"] > 0:
+            self.open_metadata_editor(track)
+        elif chosen == inspect_act:
+            self.open_pydub_inspector(track)
+        elif chosen in pl_actions and track["id"] > 0:
+            self.db.add_track_to_playlist(pl_actions[chosen], track["id"])
+
+    def open_metadata_editor(self, track):
+        dlg = MetadataEditorDialog(track, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            title, artist, album, genre, lyrics = dlg.get_values()
+            self.db.update_metadata(track["id"], title, artist, album, genre, lyrics)
+            MediaHelper.write_file_tags(track["filepath"], title, artist, album, genre)
+            self.refresh_current_table()
+
+    def open_pydub_inspector(self, track):
+        info = MediaHelper.inspect_audio_with_pydub(track["filepath"])
+        if not info:
+            QMessageBox.information(
+                self,
+                "Audio Inspector",
+                f"File: {track['filepath']}\n(Install pydub + ffmpeg for deep waveform dBFS analysis)"
+            )
+            return
+        msg = (
+            f"Track: {track['title']}\n"
+            f"Duration: {info['duration_sec']} sec\n"
+            f"Sample Rate: {info['frame_rate']} Hz\n"
+            f"Channels: {info['channels']} (Bit depth: {info['sample_width_bits']}-bit)\n"
+            f"Average Loudness: {info['dBFS']} dBFS\n"
+            f"Peak Level: {info['max_dBFS']} dBFS"
+        )
+        QMessageBox.information(self, "🔬 Pydub Audio Analysis", msg)
+
+    def fetch_lyrics_for_current(self):
+        if not self.current_track:
+            return
+        lyr = MediaHelper.fetch_online_lyrics(
+            self.current_track["artist"], self.current_track["title"]
+        )
+        if lyr:
+            self.lyrics_box.setPlainText(lyr)
+            self.save_current_lyrics()
+        else:
+            QMessageBox.information(
+                self, "Lyrics Lookup", "No online lyrics found for this track. You can paste lyrics manually and click Save."
+            )
+
+    def save_current_lyrics(self):
+        if not self.current_track or self.current_track["id"] <= 0:
+            return
+        txt = self.lyrics_box.toPlainText().strip()
+        t = self.current_track
+        self.db.update_metadata(t["id"], t["title"], t["artist"], t["album"], t.get("genre", ""), txt)
+        self.current_track["lyrics"] = txt
+
+    # -------------------------------------------------------------------------
+    # PLAYLISTS, QUEUE, EQUALIZER & WINDOW MODES
+    # -------------------------------------------------------------------------
+    def on_nav_clicked(self, item):
+        self.playlist_list.clearSelection()
+        self.load_library_view(item.data(Qt.ItemDataRole.UserRole))
+
+    def create_new_playlist(self):
+        name, ok = QInputDialog.getText(self, "New Playlist", "Enter Playlist Name:")
+        if ok and name.strip():
+            self.db.create_playlist(name.strip())
+            self.refresh_playlists_sidebar()
+
+    def refresh_playlists_sidebar(self):
+        self.playlist_list.clear()
+        for pl in self.db.get_playlists():
+            item = QListWidgetItem(f"🎶  {pl['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, pl["id"])
+            self.playlist_list.addItem(item)
+
+    def on_playlist_clicked(self, item):
+        self.nav_list.clearSelection()
+        pl_id = item.data(Qt.ItemDataRole.UserRole)
+        self.current_view = "playlist"
+        self.current_playlist_id = pl_id
+        self.view_title_lbl.setText(f"PLAYLIST: {item.text().upper()}")
+        self.refresh_current_table()
+
+    def on_playlist_context_menu(self, pos):
+        item = self.playlist_list.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self)
+        del_act = menu.addAction("🗑️ Delete Playlist")
+        if menu.exec(self.playlist_list.viewport().mapToGlobal(pos)) == del_act:
+            self.db.delete_playlist(item.data(Qt.ItemDataRole.UserRole))
+            self.refresh_playlists_sidebar()
+            self.load_library_view("all")
+
+    def refresh_queue_ui(self):
+        self.queue_list.clear()
+        for tr in self.queue:
+            self.queue_list.addItem(f"{tr['title']} - {tr['artist']}")
+
+    def clear_queue(self):
+        self.queue.clear()
+        self.refresh_queue_ui()
+
+    def on_queue_item_double_clicked(self, item):
+        idx = self.queue_list.row(item)
+        if 0 <= idx < len(self.queue):
+            tr = self.queue.pop(idx)
+            self.refresh_queue_ui()
+            self.play_track_dict(tr)
+
+    def apply_eq_preset(self, preset_name):
+        gains = EQ_PRESETS.get(preset_name, [0] * 10)
+        for i, val in enumerate(gains):
+            self.eq_sliders[i].setValue(val)
+
+    def apply_theme(self):
+        if self.is_dark_mode:
+            self.setStyleSheet(DARK_THEME_QSS)
+            self.visualizer.set_theme_background("#181818")
+            self.theme_btn.setText("☀️ Light")
+        else:
+            self.setStyleSheet(LIGHT_THEME_QSS)
+            self.visualizer.set_theme_background("#FFFFFF")
+            self.theme_btn.setText("🌙 Dark")
+
+    def toggle_theme(self):
+        self.is_dark_mode = not self.is_dark_mode
+        self.apply_theme()
+
+    def toggle_mini_player(self):
+        self.is_mini_mode = not self.is_mini_mode
+        if self.is_mini_mode:
+            self.left_panel.hide()
+            self.right_panel.hide()
+            self.track_table.hide()
+            self.resize(580, 310)
+            self.mini_btn.setText("🗖 Expand")
+        else:
+            self.left_panel.show()
+            self.right_panel.show()
+            self.track_table.show()
+            self.resize(1340, 820)
+            self.mini_btn.setText("🗕 Mini")
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    # -------------------------------------------------------------------------
+    # TIMERS: VISUALIZER, PROGRESS BAR, CROSSFADE & SLEEP TIMER
+    # -------------------------------------------------------------------------
+    def on_sleep_timer_changed(self, idx):
+        minutes_map = {0: 0, 1: 5, 2: 15, 3: 30, 4: 60}
+        mins = minutes_map.get(idx, 0)
+        self.sleep_remaining_sec = mins * 60
+        self.sleep_status_lbl.setText("Off" if mins == 0 else f"{mins}:00")
+
+    def on_sleep_tick(self):
+        if self.sleep_remaining_sec > 0:
+            self.sleep_remaining_sec -= 1
+            m, s = divmod(self.sleep_remaining_sec, 60)
+            self.sleep_status_lbl.setText(f"{m}:{s:02d}")
+            if self.sleep_remaining_sec == 0:
+                self.stop_playback()
+                self.sleep_combo.setCurrentIndex(0)
+
+    def on_timer_tick(self):
+        playing = self.engine.is_playing()
+        if not self.engine.has_vlc and playing:
+            self.engine.sim_position += 0.08 * self.engine.rate
+
+        self.visualizer.update_spectrum(
+            playing,
+            self.vol_slider.value(),
+            self.engine.eq_gains,
+            self.engine.bass_boost,
+            self.engine.treble_boost
+        )
+
+        if not self.current_track or not playing:
+            return
+
+        cur_sec = self.engine.get_time_sec()
+        tot_sec = self.engine.get_length_sec() or self.current_track.get("duration", 0.0)
+
+        self.time_cur_lbl.setText(self.format_seconds(cur_sec))
+        self.time_tot_lbl.setText(self.format_seconds(tot_sec))
+
+        if tot_sec > 0 and not self.is_seeking:
+            ratio = min(1.0, cur_sec / tot_sec)
+            self.seek_slider.setValue(int(ratio * 1000))
+
+            # Crossfade or Track End Handling
+            remaining = tot_sec - cur_sec
+            if remaining <= max(0.4, float(self.crossfade_sec)):
+                if self.repeat_mode == 2:
+                    self.play_track_dict(self.current_track)
+                elif self.repeat_mode == 1 or self.current_index < len(self.displayed_tracks) - 1 or self.queue:
+                    self.play_next()
+                else:
+                    self.stop_playback()
+
+    @staticmethod
+    def format_seconds(sec):
+        sec = max(0, int(sec))
+        m, s = divmod(sec, 60)
+        return f"{m}:{s:02d}"
+
+
+# =============================================================================
+# 8. SPYDER-COMPATIBLE APPLICATION ENTRY POINT
+# =============================================================================
+
+def main():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    app.setApplicationName("Prince Music Studio")
+    window = PrinceMusicStudio()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
